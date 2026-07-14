@@ -1,0 +1,204 @@
+---
+name: icp-debug
+description: Debug, fix, and validate Internet Computer (ICP) applications — Motoko and Rust
+  canisters, icp-cli and dfx environments, local replica and mainnet deploys, Candid
+  interfaces, inter-canister calls, frontend agent integration, identity and cycles. Use
+  when an ICP project fails to build, fails to deploy, traps at runtime, returns reject
+  codes, or when canister calls succeed from the CLI but fail from the browser. Also use
+  for Candid mismatches, "Registry not set" / "Admin not set" errors, replica connection
+  failures, and WSL/corporate-proxy issues blocking the replica. Do not use for general
+  blockchain questions unrelated to ICP, or for Solidity/EVM work.
+---
+
+# ICP Debugging
+
+## Prime directives
+
+These override everything below. They are the point of this skill.
+
+- **Do not guess.** If the cause is not established, say so and ask for what would establish it.
+- **Reproduce before diagnosing.** An unreproduced bug is a hypothesis.
+- **Never assume hidden state.** Do not assume a canister is initialized, wired, funded, or upgraded. Verify it.
+- **Ask for logs or files if missing.** Do not proceed on a paraphrased error. Ask for the literal output.
+- **Isolate root cause before proposing a fix.** One cause, then one minimal fix.
+- **Always validate after changing anything.**
+
+## Step 0: Orient (always, before any branch)
+
+Cheap, and it gates every downstream command. Never skip.
+
+**Detect the toolchain.** This determines nearly every command that follows.
+- `icp.yaml` at project root → **icp-cli** (`icp ...`)
+- `dfx.json` at project root → **dfx** (`dfx ...`)
+- Both → ask which the user actually runs. Do not assume.
+
+**Collect:**
+```bash
+icp --version      # or: dfx --version
+node -v && npm -v
+env | grep -i proxy
+```
+Plus, as relevant: `moc --version`, `mops --version`, `cargo --version`.
+
+**Establish:**
+- OS and environment — **native Linux, WSL, or Windows?** WSL changes the network branch entirely.
+- Network mode — local replica or `ic` mainnet?
+- Does the failure reproduce? On both networks, or only one?
+
+A failure that reproduces on local but not mainnet (or vice versa) is a strong signal.
+Local-only → environment, replica, or proxy. Mainnet-only → cycles, identity, or a build
+artifact that was never redeployed.
+
+## Step 1: Route by symptom
+
+Do not walk every section. Enter at the matching row and stay there until the cause is isolated.
+
+| Symptom | Go to |
+|---|---|
+| Nothing reaches the replica at all; timeouts, connection reset, TLS errors | **Network & proxy** (check first) |
+| Compile error, type error, `.did` not generated, mops/cargo failure | **Build** |
+| Build succeeds, deploy fails; no canister ID; launcher exits | **Deploy** |
+| Deploys, but calls trap or return a reject code | **Runtime & canister logic** |
+| Calls work from CLI but fail from the browser | **Frontend integration** |
+| Call succeeds but arguments/results are wrong or fail to decode | **Candid & inter-canister** |
+
+**Hoist the network check.** Proxy, WSL, and DNS failures *masquerade* as build and deploy
+failures. If the environment has a corporate proxy (Zscaler and similar), is on WSL, or shows
+anything in `env | grep -i proxy`, rule out the network branch **before** debugging Motoko.
+Otherwise you will chase phantom compile errors for ten turns.
+
+---
+
+## Network & proxy
+
+Symptoms: connection reset, timeouts, certificate errors, replica unreachable, deploy hangs.
+
+```bash
+curl -v https://ic0.app        # is the outside world reachable?
+curl -v http://127.0.0.1:4943  # is the local replica reachable? (adjust port)
+```
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| TLS/cert error on `curl https://ic0.app` | TLS-inspecting proxy injecting its own CA | Add the corporate CA to the system trust store and to `NODE_EXTRA_CA_CERTS` for the JS agent |
+| Replica unreachable from Windows browser, fine inside WSL | WSL2 network namespace — replica bound to WSL's loopback | Bind the replica to `0.0.0.0`, or reach it via the WSL VM's IP; `localhost` is not shared |
+| Everything hangs, including `curl` | Proxy env vars set but blocking loopback | Add `127.0.0.1,localhost` to `NO_PROXY` |
+| DNS failures | Corporate DNS not resolving IC domains | `nslookup ic0.app`; escalate to network config |
+
+If the network is the cause, **stop here.** Do not proceed to other branches.
+
+---
+
+## Build
+
+```bash
+icp build --debug      # or: dfx build
+```
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Motoko type or syntax error | Real compile error | Read the trap location; fix the type. Minimal edit only. |
+| Import cannot be resolved | Broken mops dep or missing `mops install` | Re-run `mops install`; check `mops.toml` vs `mops.lock` for drift |
+| `mops.lock` inconsistent | Lockfile stale, or dep added without install | Reinstall to regenerate; do not hand-edit |
+| `.did` not generated | Candid gen failed silently after a compile error | Fix the compile error first — candid gen runs *after* a successful build |
+| Rust: wasm target missing | `wasm32-unknown-unknown` not installed | `rustup target add wasm32-unknown-unknown` |
+
+**Never debug a deploy failure while the build is broken.** A stale `.wasm` from a previous
+successful build will happily deploy and then behave like the code you did not just write.
+
+---
+
+## Deploy
+
+```bash
+icp deploy      # or: dfx deploy
+```
+
+Check, in order:
+1. **Cycles balance.** The most common mainnet deploy failure, with the least helpful errors.
+2. **Canister IDs generated?** If not, the deploy did not get far enough to matter.
+3. **`descriptor.json` / canister ID file contents.** Missing or stale IDs here are why the
+   frontend later "cannot find" a canister that plainly exists.
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `network launcher exited` | Stale replica process holding the port | Kill the orphaned process; confirm port free; restart clean |
+| `canister not found` | Canister ID file stale, or wrong target network | Confirm target network matches where the canister was created |
+| `invalid wasm` | Corrupt or partial build output | Clean and rebuild — do not redeploy the same artifact |
+| Deploy succeeds, canister is inert | **Init never ran, or wiring calls never made** | See Runtime — this is not a deploy bug |
+
+---
+
+## Runtime & canister logic
+
+Symptoms: `ic0.trap`, reject codes, methods failing on a canister that deployed fine.
+
+| Symptom | What it actually means | Fix |
+|---|---|---|
+| `Admin not set` | `init()` never ran, ran without the admin principal, or a **post-upgrade wiped it** because it was not stable | Set admin in `init()`; mark it `stable`; re-verify after upgrade |
+| `Registry not set` | The **post-deploy wiring call was never made.** Deploying canisters does not connect them — that is a separate call. | Make the wiring call after deploy. Script it, or it will be forgotten every time. |
+| `ic0.trap` on a method that worked before | State lost across upgrade — a non-`stable` var reset to default | Mark it `stable`, or restore in `postupgrade()` |
+| `CanisterError` reject | Trap inside the callee; its trap message is the real error | Read the *callee's* logs, not the caller's |
+| Access control fails for the right principal | Anonymous principal reaching the canister | See Frontend — identity not attached agent-side |
+
+**Validate the initialization flow explicitly:**
+- `init()` — runs **once**, on first install. Not on upgrade.
+- `postupgrade()` — runs on upgrade. Anything not `stable` is **gone** by the time it runs.
+- Stable variables — all state that must survive an upgrade must be `stable`. Source of most
+  "it worked yesterday" bugs.
+- Post-deploy wiring — admin setup, registry registration, inter-canister references.
+  **These are not part of deploy.** If not scripted, not happening.
+
+---
+
+## Candid & inter-canister
+
+```bash
+icp canister call <canister> <method> '(<args>)'
+```
+Also use the Candid UI to exercise methods independent of any frontend.
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Method not found | `.did` is stale — caller using a pre-build `.did` | Regenerate `.did`, regenerate frontend declarations, rebuild frontend |
+| Encoding/decoding error | Type mismatch between caller's `.did` and the actual signature | Diff the deployed `.did` against the one the caller uses |
+| `opt` field arrives null | Optional-field encoding mismatch | Check exact `opt` nesting on both sides |
+| Inter-canister call rejects | Callee trapped, or its interface changed without the caller rebuilt | Read the callee's trap, then rebuild both sides |
+
+**The `.did` is the contract.** Verify it matches the *deployed* canister, not the local source tree.
+
+---
+
+## Frontend integration
+
+CLI works, browser does not — that asymmetry isolates the fault to the agent layer.
+
+- **Agent host URL** correct for the target network?
+- **Canister IDs** — current, or baked in at an earlier build?
+- **Gateway port** — wrong replica port is the most common local cause.
+- **Root key** — for **local** replicas the agent must fetch it. Local-only; doing this against
+  mainnet is a security hole.
+- **Identity attached?** No identity → every call arrives as the **anonymous principal**, which
+  fails access control in a way that looks like a canister bug but is not.
+
+---
+
+## Output format (diagnostic responses only)
+
+1. **Root cause** — one sentence, one cause.
+2. **Evidence** — the specific log line, file content, or command output. Not reasoning; evidence.
+3. **Fix** — minimal code or config change.
+4. **Commands to apply it.**
+5. **Verification** — the command that proves it fixed, and what its output should be.
+
+**Do not use this format for non-diagnostic work** (design questions, optimization advice).
+Answer those directly and technically.
+
+## Scope
+
+This skill covers **debugging**. Testing and optimization are separate workflows — do not fold
+them in, or all three get shallow treatment.
+
+If asked to optimize, the ICP-specific targets are: cycle consumption, stable-memory footprint,
+unnecessary storage writes, and loops over growing collections. If asked to test, cover every
+public method plus upgrade behavior — the state-across-upgrade path is where the bugs live.
